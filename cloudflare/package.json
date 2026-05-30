@@ -1,0 +1,16 @@
+{
+  "name": "sportslivetoday-scraper-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers version of the sportslivetoday.com scraper + HLS stream proxy.",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}

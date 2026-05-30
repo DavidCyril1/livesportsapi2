@@ -1,0 +1,36 @@
+{
+  "name": "livesportsapi2",
+  "version": "1.0.0",
+  "description": "Standalone scraper for sportslivetoday.com — live football matches with HLS m3u8 stream URLs and a built-in stream proxy that adds the required Referer/User-Agent headers.",
+  "main": "dist/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts"
+  },
+  "keywords": [
+    "football",
+    "soccer",
+    "live-scores",
+    "hls",
+    "m3u8",
+    "scraper",
+    "sportslivetoday"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "swagger-ui-express": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.17.10",
+    "@types/swagger-ui-express": "^4.1.8",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}

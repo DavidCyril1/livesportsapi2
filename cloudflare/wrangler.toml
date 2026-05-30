@@ -1,0 +1,10 @@
+name = "sportslivetoday-scraper"
+main = "src/worker.ts"
+compatibility_date = "2025-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# Optional: bind a custom domain or route once deployed
+# routes = [{ pattern = "scraper.example.com/*", custom_domain = true }]
+
+[observability]
+enabled = true
