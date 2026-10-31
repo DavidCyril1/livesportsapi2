@@ -9,6 +9,12 @@ import {
   type SportType,
 } from "./scraper";
 import streamProxyRouter from "./stream-proxy";
+import {
+  listSoccerStreams,
+  findStreamFreeKey,
+  resolveStreamFreeM3u8,
+  fetchStreamFreePlaylist,
+} from "./streamfree";
 import { buildOpenApiSpec } from "./openapi";
 
 const app = express();
@@ -327,6 +333,84 @@ app.get("/api/cricket/streams", cricket.streams);
 
 // ---------- Stream proxy router ----------
 app.use("/api", streamProxyRouter);
+
+// ---------- StreamFree (strmfree.st) — same role as other panel stream sources ----------
+app.get("/api/streamfree/streams", async (_req, res) => {
+  try {
+    const streams = await listSoccerStreams();
+    res.json({ count: streams.length, streams });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "list_failed" });
+  }
+});
+
+app.get("/api/streamfree/match", async (req, res) => {
+  try {
+    const home = String(req.query.home || "");
+    const away = String(req.query.away || "");
+    if (!home || !away) {
+      res.status(400).json({ error: "home and away required" });
+      return;
+    }
+    const hit = await findStreamFreeKey(home, away);
+    if (!hit) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    res.json({
+      stream_key: hit.stream_key,
+      name: hit.name,
+      playlistUrl: `/api/streamfree/playlist?key=${encodeURIComponent(hit.stream_key)}&quality=1080p`,
+      embedUrl: hit.live_sources?.[0]?.url || hit.sources?.[0]?.url || null,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "match_failed" });
+  }
+});
+
+app.get("/api/streamfree/resolve", async (req, res) => {
+  try {
+    const key = String(req.query.key || "").trim().toLowerCase();
+    const quality = (["1080p", "720p", "540p"].includes(String(req.query.quality || ""))
+      ? String(req.query.quality)
+      : "1080p") as "1080p" | "720p" | "540p";
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key)) {
+      res.status(400).json({ error: "bad_key" });
+      return;
+    }
+    const resolved = await resolveStreamFreeM3u8(key, quality);
+    res.json({ ok: true, ...resolved });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "resolve_failed" });
+  }
+});
+
+/** Playlist only (~KB). Segments stay on provider CDN — no heavy bandwidth on panel. */
+app.get("/api/streamfree/playlist", async (req, res) => {
+  try {
+    const key = String(req.query.key || "").trim().toLowerCase();
+    const quality = (["1080p", "720p", "540p"].includes(String(req.query.quality || ""))
+      ? String(req.query.quality)
+      : "1080p") as "1080p" | "720p" | "540p";
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key) || key.length > 120) {
+      res.status(400).json({ error: "bad_key" });
+      return;
+    }
+    if (String(req.query.format || "") === "json") {
+      const resolved = await resolveStreamFreeM3u8(key, quality);
+      res.json({ ok: true, ...resolved });
+      return;
+    }
+    const text = await fetchStreamFreePlaylist(key, quality);
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.send(text);
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "playlist_failed" });
+  }
+});
+
 
 // ---------- OpenAPI + Swagger UI ----------
 app.get("/openapi.json", (req, res) => {
