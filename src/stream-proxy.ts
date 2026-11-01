@@ -1,6 +1,18 @@
 import { Router, type Request, type Response } from "express";
 import axios from "axios";
 import { getFreshStreamUrl } from "./scraper";
+import {
+  listSoccerStreams,
+  findStreamFreeKey,
+  resolveStreamFreeM3u8,
+  fetchUpstreamText,
+  fetchUpstreamBinary,
+  rewritePlaylistThroughProxy,
+  isAllowedStreamFreeProxyUrl,
+  isValidStreamKey,
+  parseQuality,
+  SF_ORIGIN,
+} from "./streamfree";
 
 const router = Router();
 
@@ -149,5 +161,156 @@ router.get("/stream/live/:id", async (req, res) => {
     note: "freshPlaylistUrl is a stable URL — it auto-refreshes the upstream sign token on every request. Use it directly in <video src> or hls.js.",
   });
 });
+
+
+// ── StreamFree (same shape as /stream/live/:id/playlist.m3u8) ────────────────
+function streamfreePublicBase(req: Request): string {
+  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol;
+  return `${proto}://${req.get("host")}`;
+}
+
+function streamfreeProxyPath(req: Request): string {
+  return `${streamfreePublicBase(req)}/api/streamfree/proxy`;
+}
+
+/** List live soccer keys */
+router.get("/streamfree/streams", async (_req, res) => {
+  try {
+    const streams = await listSoccerStreams();
+    const live = streams.filter((s) => (s.live_sources && s.live_sources.length) || (s.sources && s.sources.length));
+    res.json({
+      count: live.length,
+      streams: live.map((s) => ({
+        name: s.name,
+        stream_key: s.stream_key,
+        playlistUrl: `/api/streamfree/live/${encodeURIComponent(s.stream_key)}/playlist.m3u8`,
+      })),
+    });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "list_failed" });
+  }
+});
+
+/** Match home/away teams → streamfree key + playlist URL */
+router.get("/streamfree/match", async (req, res) => {
+  try {
+    const home = String(req.query.home || "");
+    const away = String(req.query.away || "");
+    if (!home || !away) {
+      res.status(400).json({ error: "home and away required" });
+      return;
+    }
+    const hit = await findStreamFreeKey(home, away);
+    if (!hit) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    const key = hit.stream_key;
+    res.json({
+      stream_key: key,
+      name: hit.name,
+      playlistUrl: `${streamfreePublicBase(req)}/api/streamfree/live/${encodeURIComponent(key)}/playlist.m3u8`,
+      jsonUrl: `${streamfreePublicBase(req)}/api/streamfree/live/${encodeURIComponent(key)}`,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "match_failed" });
+  }
+});
+
+/** JSON: resolved upstream + stable panel playlist */
+router.get("/streamfree/live/:key", async (req, res) => {
+  try {
+    const key = String(req.params.key || "").toLowerCase();
+    const quality = parseQuality(req.query.quality);
+    if (!isValidStreamKey(key)) {
+      res.status(400).json({ error: "bad_key" });
+      return;
+    }
+    const resolved = await resolveStreamFreeM3u8(key, quality);
+    res.json({
+      ok: true,
+      stream_key: key,
+      quality,
+      upstreamM3u8: resolved.m3u8,
+      playlistUrl: `${streamfreePublicBase(req)}/api/streamfree/live/${encodeURIComponent(key)}/playlist.m3u8?quality=${quality}`,
+      proxyBase: streamfreeProxyPath(req),
+    });
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "resolve_failed" });
+  }
+});
+
+/**
+ * Self-refreshing playlist for players (m3u8player / hls.js).
+ * Same idea as /api/stream/live/:id/playlist.m3u8 — never hand the signed upstream URL to the client long-term.
+ * Segment lines are rewritten through /api/streamfree/proxy so Referer is injected server-side.
+ */
+router.get("/streamfree/live/:key/playlist.m3u8", async (req, res) => {
+  try {
+    const key = String(req.params.key || "").toLowerCase();
+    const quality = parseQuality(req.query.quality);
+    if (!isValidStreamKey(key)) {
+      res.status(400).json({ error: "bad_key" });
+      return;
+    }
+    const resolved = await resolveStreamFreeM3u8(key, quality);
+    const up = await fetchUpstreamText(resolved.m3u8, resolved.referer);
+    if (up.status >= 400 || !up.text.startsWith("#EXTM3U")) {
+      res.status(502).json({ error: `upstream_playlist_${up.status}` });
+      return;
+    }
+    const rewritten = rewritePlaylistThroughProxy(
+      up.text,
+      resolved.m3u8,
+      streamfreeProxyPath(req),
+    );
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.send(rewritten);
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "playlist_failed" });
+  }
+});
+
+/** Proxy playlist segments / nested playlists (Referer injected). Host allow-list. */
+router.get("/streamfree/proxy", async (req, res) => {
+  try {
+    const target = String(req.query.url || "");
+    if (!target || !isAllowedStreamFreeProxyUrl(target)) {
+      res.status(403).json({ error: "host_not_allowed" });
+      return;
+    }
+    const referer = `${SF_ORIGIN}/`;
+    const isPlaylist = target.includes(".m3u8");
+    if (isPlaylist) {
+      const up = await fetchUpstreamText(target, referer);
+      if (up.status >= 400) {
+        res.status(up.status).json({ error: "upstream_error" });
+        return;
+      }
+      const body = up.text.startsWith("#EXTM3U")
+        ? rewritePlaylistThroughProxy(up.text, target, streamfreeProxyPath(req))
+        : up.text;
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.send(body);
+      return;
+    }
+    const up = await fetchUpstreamBinary(target, referer);
+    if (up.status >= 400) {
+      res.status(up.status).json({ error: "upstream_error" });
+      return;
+    }
+    res.setHeader("Content-Type", up.contentType || "application/octet-stream");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.send(Buffer.from(up.buf));
+  } catch (e) {
+    res.status(502).json({ error: e instanceof Error ? e.message : "proxy_failed" });
+  }
+});
+
 
 export default router;
