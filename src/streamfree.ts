@@ -1,4 +1,12 @@
-/** StreamFree (strmfree.st) — resolve signed HLS; playlist-only proxy. */
+/**
+ * StreamFree (streamfree.top / strmfree.st)
+ * Resolve signed HLS and serve panel playlist URLs matching sports style:
+ *   GET /api/streamfree/live/:key/playlist.m3u8
+ *   GET /api/streamfree/live/:key
+ *   GET /api/streamfree/streams
+ *   GET /api/streamfree/match?home=&away=
+ *   GET /api/streamfree/proxy?url=   (segments + playlists, Referer injected)
+ */
 
 const SF_ORIGIN = "https://streamfree.top";
 const UA =
@@ -14,6 +22,8 @@ export type StreamFreeStream = {
   live_sources?: { quality: string; url: string }[];
   sources?: { quality: string; url: string }[];
 };
+
+export type Quality = "1080p" | "720p" | "540p";
 
 function norm(s: string): string {
   return s
@@ -35,6 +45,16 @@ function teamHit(a: string, b: string): boolean {
   let hits = 0;
   for (const w of ta) if (tb.has(w)) hits++;
   return hits >= 1 && hits >= Math.min(2, ta.length);
+}
+
+export function isValidStreamKey(key: string): boolean {
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(key) && key.length <= 120;
+}
+
+export function parseQuality(q: unknown): Quality {
+  const s = String(q || "1080p");
+  if (s === "720p" || s === "540p" || s === "1080p") return s;
+  return "1080p";
 }
 
 export async function listSoccerStreams(): Promise<StreamFreeStream[]> {
@@ -114,8 +134,9 @@ function parseEmbed(html: string, key: string, quality: string): { variant: stri
 
 export async function resolveStreamFreeM3u8(
   streamKey: string,
-  quality: "1080p" | "720p" | "540p" = "1080p",
+  quality: Quality = "1080p",
 ): Promise<{ m3u8: string; embedUrl: string; referer: string }> {
+  if (!isValidStreamKey(streamKey)) throw new Error("bad_key");
   const embedUrl = `${SF_ORIGIN}/embed/soccer/${streamKey}${quality}`;
   const playerRef = `${SF_ORIGIN}/player/soccer/${streamKey}`;
 
@@ -158,21 +179,123 @@ export async function resolveStreamFreeM3u8(
   return { m3u8: m3u8.href, embedUrl, referer: embedUrl };
 }
 
-export async function fetchStreamFreePlaylist(
-  streamKey: string,
-  quality: "1080p" | "720p" | "540p" = "1080p",
-): Promise<string> {
-  const { m3u8, referer } = await resolveStreamFreeM3u8(streamKey, quality);
-  const r = await fetch(m3u8, {
+export async function fetchUpstreamText(
+  url: string,
+  referer: string,
+): Promise<{ status: number; text: string; contentType: string }> {
+  const r = await fetch(url, {
     headers: {
       "User-Agent": UA,
-      Referer: referer,
-      Accept: "application/vnd.apple.mpegurl,*/*",
+      Referer: referer || SF_ORIGIN + "/",
+      Origin: SF_ORIGIN,
+      Accept: "*/*",
     },
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(15_000),
   });
-  if (!r.ok) throw new Error(`playlist_${r.status}`);
   const text = await r.text();
-  if (!text.startsWith("#EXTM3U")) throw new Error("not_m3u8");
-  return text;
+  return {
+    status: r.status,
+    text,
+    contentType: r.headers.get("content-type") || "application/octet-stream",
+  };
 }
+
+export async function fetchUpstreamBinary(
+  url: string,
+  referer: string,
+): Promise<{ status: number; buf: ArrayBuffer; contentType: string }> {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Referer: referer || SF_ORIGIN + "/",
+      Origin: SF_ORIGIN,
+      Accept: "*/*",
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const buf = await r.arrayBuffer();
+  return {
+    status: r.status,
+    buf,
+    contentType: r.headers.get("content-type") || "application/octet-stream",
+  };
+}
+
+/** Rewrite relative playlist lines to absolute URLs on the upstream host. */
+export function absolutizePlaylist(text: string, sourceUrl: string): string {
+  const baseUrl = sourceUrl.substring(0, sourceUrl.lastIndexOf("/") + 1);
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith("#")) {
+        const uriMatch = trimmed.match(/URI="([^"]+)"/);
+        if (uriMatch) {
+          const uri = uriMatch[1];
+          const absolute = uri.startsWith("http") ? uri : baseUrl + uri;
+          return line.replace(uri, absolute);
+        }
+        return line;
+      }
+      if (trimmed.startsWith("http")) return trimmed;
+      return baseUrl + trimmed;
+    })
+    .join("\n");
+}
+
+/**
+ * Rewrite every media URI through our panel proxy so players never need StreamFree cookies/Referer.
+ * Playlist body stays small; segment bytes still pass through panel when requested (same as sports proxy).
+ */
+export function rewritePlaylistThroughProxy(
+  text: string,
+  sourceUrl: string,
+  proxyBase: string,
+): string {
+  const absolute = absolutizePlaylist(text, sourceUrl);
+  return absolute
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith("#")) {
+        const uriMatch = trimmed.match(/URI="([^"]+)"/);
+        if (uriMatch) {
+          const abs = uriMatch[1];
+          const proxied = `${proxyBase}?url=${encodeURIComponent(abs)}`;
+          return line.replace(abs, proxied);
+        }
+        return line;
+      }
+      if (trimmed.startsWith("http")) {
+        return `${proxyBase}?url=${encodeURIComponent(trimmed)}`;
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+const ALLOWED_PROXY_HOST_SUFFIXES = [
+  "streamfree.top",
+  "strmfree.st",
+  "ttcdn.cc",
+  "tiktokcdn.com",
+  "byteoversea.com",
+  "ibytedtos.com",
+];
+
+export function isAllowedStreamFreeProxyUrl(target: string): boolean {
+  try {
+    const u = new URL(target);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    return ALLOWED_PROXY_HOST_SUFFIXES.some(
+      (s) => host === s || host.endsWith("." + s),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export { SF_ORIGIN, UA };
